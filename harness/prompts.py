@@ -6,7 +6,7 @@ class Prompt:
     name: str
     text: str
 
-
+# Three prompts of different complexity
 PROMPTS: list[Prompt] = [
     Prompt(
         name="short",

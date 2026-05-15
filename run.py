@@ -1,71 +1,44 @@
 import argparse
 import json
-import os
 from datetime import datetime, timezone
 from pathlib import Path
 
-from dotenv import load_dotenv
-
-from harness.metrics import format_summary_table, summarize
+from harness.load_runner import sweep_concurrency
+from harness.plot import plot_ttft_vs_throughput
 from harness.prompts import PROMPTS
-from harness.providers.anthropic import AnthropicProvider
-from harness.runner import run_benchmark
+from harness.providers.llama_cpp import LlamaCppProvider
 
 
 def main():
-    load_dotenv()
-
-    parser = argparse.ArgumentParser(description="Inference benchmarking harness")
-    parser.add_argument("--model", default="claude-haiku-4-5", help="Anthropic model id")
-    parser.add_argument("--iterations", type=int, default=3, help="Iterations per prompt")
-    parser.add_argument("--max-tokens", type=int, default=1024, help="Max output tokens per request")
-    parser.add_argument("--results-dir", default="results", help="Directory to write JSON results")
+    parser = argparse.ArgumentParser(description="TTFT vs throughput sweep")
+    parser.add_argument("--model", required=True, help="Model name (label for llama.cpp)")
+    parser.add_argument("--base-url", default="http://localhost:8080/v1")
+    parser.add_argument("--levels", type=int, nargs="+", default=[1, 2, 4, 8])
+    parser.add_argument("--prompt", default="medium", choices=[p.name for p in PROMPTS])
+    parser.add_argument("--max-tokens", type=int, default=512)
+    parser.add_argument("--results-dir", default="results")
     args = parser.parse_args()
 
-    if not os.getenv("ANTHROPIC_API_KEY"):
-        raise SystemExit("ANTHROPIC_API_KEY not set (check .env)")
-
-    provider = AnthropicProvider(model=args.model)
+    prompt = next(p for p in PROMPTS if p.name == args.prompt)
+    provider = LlamaCppProvider(model=args.model, base_url=args.base_url)
 
     def progress(r):
-        print(
-            f"  [{r.prompt_name} #{r.iteration}] "
-            f"ttft={r.ttft_seconds:.3f}s  tps={r.tokens_per_second:.1f}  "
-            f"out={r.output_tokens} tok"
-        )
+        print(f"  [n={r['concurrency']}] ttft={r['mean_ttft']:.3f}s  tps={r['throughput_tps']:.1f}")
 
-    print(f"Running {args.iterations} iterations × {len(PROMPTS)} prompts on {args.model}")
-    results = run_benchmark(
-        provider=provider,
-        prompts=PROMPTS,
-        iterations=args.iterations,
-        max_tokens=args.max_tokens,
-        on_progress=progress,
-    )
-
-    summary = summarize(results)
-
-    print("\nSummary:")
-    print(format_summary_table(summary))
+    print(f"Sweeping concurrency {args.levels} on {args.model}")
+    results = sweep_concurrency(provider, prompt, args.levels, args.max_tokens, progress)
 
     results_dir = Path(args.results_dir)
     results_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    out_path = results_dir / f"run_{ts}.json"
-    with out_path.open("w") as f:
-        json.dump(
-            {
-                "model": args.model,
-                "iterations": args.iterations,
-                "max_tokens": args.max_tokens,
-                "timestamp": ts,
-                "results": [r.to_dict() for r in results],
-                "summary": summary,
-            },
-            f,
-            indent=2,
-        )
-    print(f"\nWrote {out_path}")
+
+    json_path = results_dir / f"sweep_{ts}.json"
+    with json_path.open("w") as f:
+        json.dump({"model": args.model, "prompt": args.prompt, "results": results}, f, indent=2)
+    print(f"Wrote {json_path}")
+
+    plot_path = str(results_dir / f"sweep_{ts}.png")
+    plot_ttft_vs_throughput(results, args.model, plot_path)
 
 
 if __name__ == "__main__":

@@ -9,13 +9,12 @@ A harness for measuring LLM inference latency and throughput across providers.
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-export ANTHROPIC_API_KEY=sk-ant-...   # or put it in a .env file (gitignored)
 ```
 
 ## Run
 
 ```bash
-python run.py                                  # defaults: 3 iters × 3 prompts × claude-haiku-4-5
+python run.py
 python run.py --model claude-sonnet-4-6 --iterations 5 --max-tokens 2048
 ```
 
@@ -41,10 +40,3 @@ harness/
 └── runner.py            # sequential run loop
 run.py                   # CLI entry point
 ```
-
-## Stages
-
-- **Stage 1 (current):** single-provider Anthropic, sequential streaming.
-- **Stage 2:** add OpenAI behind the same `Provider` interface.
-- **Stage 3:** concurrency for throughput-under-load.
-- **Stage 4:** swap fixed prompts for a dataset.
