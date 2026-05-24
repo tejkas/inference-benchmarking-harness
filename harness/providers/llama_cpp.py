@@ -7,7 +7,7 @@ class LlamaCppProvider:
     name = "llama_cpp"
 
     # init to ollama localhost 
-    def __init__(self, model: str, base_url: str = "http://localhost:11434/v1"):
+    def __init__(self, model: str, base_url: str = "http://127.0.0.1:11434/v1"):
         self.model = model
         self._client = OpenAI(base_url=base_url, api_key="local")
     
@@ -23,18 +23,20 @@ class LlamaCppProvider:
             stream_options={"include_usage": True}
         )
 
+        last_chunk = None # Needed to capture usage statistics
         for chunk in stream:
             if ttft is None and chunk.choices and chunk.choices[0].delta.content:
                 ttft = time.perf_counter() - start
-        
+            last_chunk = chunk
+
         end = time.perf_counter()
-        usage = stream.get_final_completion().usage
+        usage = last_chunk.usage if last_chunk else None
         if ttft is None:
             ttft = end - start
         
         return StreamMeasurement(
             ttft_seconds=ttft,
             generation_seconds=(end - start) - ttft,
-            output_tokens=usage.output_tokens,
-            input_tokens=usage.input_tokens,
+            output_tokens=usage.completion_tokens if usage else 0,
+            input_tokens=usage.prompt_tokens if usage else 0,
         )

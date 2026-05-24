@@ -12,7 +12,7 @@ from harness.providers.llama_cpp import LlamaCppProvider
 def main():
     parser = argparse.ArgumentParser(description="TTFT vs throughput sweep")
     parser.add_argument("--model", required=True, help="Model name (label for llama.cpp)")
-    parser.add_argument("--base-url", default="http://localhost:8080/v1")
+    parser.add_argument("--base-url", default="http://127.0.0.1:11434/v1")
     parser.add_argument("--levels", type=int, nargs="+", default=[1, 2, 4, 8])
     parser.add_argument("--prompt", default="medium", choices=[p.name for p in PROMPTS])
     parser.add_argument("--max-tokens", type=int, default=512)
@@ -25,6 +25,9 @@ def main():
     def progress(r):
         print(f"  [n={r['concurrency']}] ttft={r['mean_ttft']:.3f}s  tps={r['throughput_tps']:.1f}")
 
+    print("Warm up...")
+    provider.stream_once(prompt.text, max_tokens=1)
+    
     print(f"Sweeping concurrency {args.levels} on {args.model}")
     results = sweep_concurrency(provider, prompt, args.levels, args.max_tokens, progress)
 
