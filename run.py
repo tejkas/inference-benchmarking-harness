@@ -6,12 +6,12 @@ from pathlib import Path
 from harness.load_runner import sweep_concurrency
 from harness.plot import plot_ttft_vs_throughput
 from harness.prompts import PROMPTS
-from harness.providers.llama_cpp import LlamaCppProvider
+from harness.providers.openai_compat import OpenAICompatProvider
 
 
 def main():
     parser = argparse.ArgumentParser(description="TTFT vs throughput sweep")
-    parser.add_argument("--model", required=True, help="Model name (label for llama.cpp)")
+    parser.add_argument("--model", required=True, help="Model name as the server knows it")
     parser.add_argument("--base-url", default="http://127.0.0.1:11434/v1")
     parser.add_argument("--levels", type=int, nargs="+", default=[1, 2, 4, 8])
     parser.add_argument("--prompt", default="medium", choices=[p.name for p in PROMPTS])
@@ -20,7 +20,7 @@ def main():
     args = parser.parse_args()
 
     prompt = next(p for p in PROMPTS if p.name == args.prompt)
-    provider = LlamaCppProvider(model=args.model, base_url=args.base_url)
+    provider = OpenAICompatProvider(model=args.model, base_url=args.base_url)
 
     def progress(r):
         print(f"  [n={r['concurrency']}] ttft={r['mean_ttft']:.3f}s  tps={r['throughput_tps']:.1f}")

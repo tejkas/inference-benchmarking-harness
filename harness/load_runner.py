@@ -28,6 +28,7 @@ def run_concurrency_level(
         "throughput_tps": total_tokens / wall_clock,
         "wall_clock_seconds": wall_clock,
         "total_tokens": total_tokens,
+        "requests": [m.to_record(start) for m in measurements],
     }
 
 def sweep_concurrency(

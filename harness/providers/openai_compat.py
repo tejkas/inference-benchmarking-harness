@@ -3,17 +3,18 @@ from openai import OpenAI
 from .base import StreamMeasurement
 
 
-class LlamaCppProvider:
-    name = "llama_cpp"
+class OpenAICompatProvider:
+    """Any server exposing the OpenAI chat completions API (Ollama, llama.cpp, vLLM, SGLang)."""
 
-    # init to ollama localhost 
-    def __init__(self, model: str, base_url: str = "http://127.0.0.1:11434/v1"):
+    name = "openai_compat"
+
+    def __init__(self, model: str, base_url: str):
         self.model = model
         self._client = OpenAI(base_url=base_url, api_key="local")
-    
+
     def stream_once(self, prompt: str, max_tokens: int) -> StreamMeasurement:
-        start = time.perf_counter()
-        ttft: float | None = None
+        send_time = time.perf_counter()
+        chunk_times: list[float] = []
 
         stream = self._client.chat.completions.create(
             model=self.model,
@@ -25,18 +26,17 @@ class LlamaCppProvider:
 
         last_chunk = None # Needed to capture usage statistics
         for chunk in stream:
-            if ttft is None and chunk.choices and chunk.choices[0].delta.content:
-                ttft = time.perf_counter() - start
+            if chunk.choices and chunk.choices[0].delta.content:
+                chunk_times.append(time.perf_counter())
             last_chunk = chunk
 
-        end = time.perf_counter()
+        end_time = time.perf_counter()
         usage = last_chunk.usage if last_chunk else None
-        if ttft is None:
-            ttft = end - start
-        
+
         return StreamMeasurement(
-            ttft_seconds=ttft,
-            generation_seconds=(end - start) - ttft,
+            send_time=send_time,
+            chunk_times=chunk_times,
+            end_time=end_time,
             output_tokens=usage.completion_tokens if usage else 0,
             input_tokens=usage.prompt_tokens if usage else 0,
         )
