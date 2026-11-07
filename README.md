@@ -31,6 +31,19 @@ python run.py --model qwen2.5:7b --levels 1 2 4 8
 python run.py --model qwen2.5:3b --levels 1 2 4 8 16 --max-tokens 256 --prompt short
 ```
 
+To sample prompts from ShareGPT instead of repeating one fixed prompt (downloaded to the
+Hugging Face cache on first use, ~650 MB):
+
+```bash
+python run.py --model qwen2.5:7b --dataset sharegpt --tokenizer Qwen/Qwen2.5-7B-Instruct --ignore-eos
+```
+
+Each request gets a different prompt, and `max_tokens` is set to the length of that
+conversation's original reply. `--tokenizer` is the Hugging Face repo whose tokenizer
+counts those lengths. `--ignore-eos` asks the server to generate exactly that many tokens,
+so every engine does the same work; requests that still stop short are counted as
+`early_stops`.
+
 Results (JSON + PNG plot) are written to `results/`.
 
 ## Key findings

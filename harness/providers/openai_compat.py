@@ -8,9 +8,11 @@ class OpenAICompatProvider:
 
     name = "openai_compat"
 
-    def __init__(self, model: str, base_url: str):
+    def __init__(self, model: str, base_url: str, ignore_eos: bool = False):
         self.model = model
         self._client = OpenAI(base_url=base_url, api_key="local")
+        # Non-standard field that not every server honors; compare output_tokens against the target
+        self._extra_body = {"ignore_eos": True} if ignore_eos else None
 
     def stream_once(self, prompt: str, max_tokens: int) -> StreamMeasurement:
         send_time = time.perf_counter()
@@ -21,7 +23,8 @@ class OpenAICompatProvider:
             max_tokens=max_tokens,
             messages=[{"role": "user", "content": prompt}],
             stream=True,
-            stream_options={"include_usage": True}
+            stream_options={"include_usage": True},
+            extra_body=self._extra_body,
         )
 
         last_chunk = None # Needed to capture usage statistics

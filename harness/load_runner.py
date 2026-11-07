@@ -1,21 +1,18 @@
 import time
 from concurrent.futures import ThreadPoolExecutor
 
+from .datasets import Sample
 from .providers.base import Provider
-from .prompts import Prompt
 
 
-def run_concurrency_level(
-    provider: Provider,
-    prompt: Prompt,
-    concurrency: int,
-    max_tokens: int,
-) -> dict:
+def run_concurrency_level(provider: Provider, samples: list[Sample]) -> dict:
+    """Send one request per sample, all at once, and wait for every one to finish."""
+    concurrency = len(samples)
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
         start = time.perf_counter()
         futures = [
-            executor.submit(provider.stream_once, prompt.text, max_tokens)
-            for _ in range(concurrency)
+            executor.submit(provider.stream_once, s.prompt, s.target_output_tokens)
+            for s in samples
         ]
         measurements = [f.result() for f in futures]
         end = time.perf_counter() # calculate end within thread
@@ -28,19 +25,30 @@ def run_concurrency_level(
         "throughput_tps": total_tokens / wall_clock,
         "wall_clock_seconds": wall_clock,
         "total_tokens": total_tokens,
-        "requests": [m.to_record(start) for m in measurements],
+        # Requests that generated fewer tokens than asked for (server ignored ignore_eos, or it was off)
+        "early_stops": sum(m.output_tokens < s.target_output_tokens for m, s in zip(measurements, samples)),
+        "requests": [
+            {
+                **m.to_record(start),
+                "dataset_prompt_tokens": s.prompt_tokens,
+                "target_output_tokens": s.target_output_tokens,
+            }
+            for m, s in zip(measurements, samples)
+        ],
     }
 
 def sweep_concurrency(
       provider: Provider,
-      prompt: Prompt,
+      samples: list[Sample],
       levels: list[int],
-      max_tokens: int,
       on_progress=None,
   ) -> list[dict]:
+      """Each level takes the next len(level) samples, so no prompt is sent twice."""
       results = []
+      offset = 0
       for concurrency in levels:
-          result = run_concurrency_level(provider, prompt, concurrency, max_tokens)
+          result = run_concurrency_level(provider, samples[offset:offset + concurrency])
+          offset += concurrency
           results.append(result)
           if on_progress:
               on_progress(result)
