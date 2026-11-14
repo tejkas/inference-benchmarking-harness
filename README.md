@@ -44,7 +44,23 @@ counts those lengths. `--ignore-eos` asks the server to generate exactly that ma
 so every engine does the same work; requests that still stop short are counted as
 `early_stops`.
 
-Results (JSON + PNG plot) are written to `results/`.
+### Open-loop mode
+
+`--levels` runs closed-loop batches: each level waits for every request to finish, so the
+client never sends faster than the server answers. `--rates` instead sends requests on a
+Poisson schedule at a fixed rate and never waits, the way real traffic arrives:
+
+```bash
+python run.py --model qwen2.5:7b --dataset sharegpt --tokenizer Qwen/Qwen2.5-7B-Instruct \
+  --ignore-eos --rates 0.5 1 2 4 --num-requests 100
+```
+
+`--burstiness` below 1 makes arrivals burstier (1 is Poisson). Every request is recorded with
+its scheduled and actual send time, and failures (HTTP errors, timeouts, dropped connections)
+are recorded with a label instead of stopping the run. The run warns if the client itself fell
+behind the schedule or its event loop stalled, since either would distort the timestamps.
+
+Results (JSON, plus a PNG plot in closed-loop mode) are written to `results/`.
 
 ## Key findings
 

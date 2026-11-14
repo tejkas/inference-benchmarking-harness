@@ -101,8 +101,10 @@ class AsyncOpenAICompatProvider:
             send_time=send_time,
             chunk_times=chunk_times,
             end_time=end_time,
-            output_tokens=usage["completion_tokens"] if usage else 0,
+            # Without usage, fall back to chunks (one per token on Ollama, not on every engine)
+            output_tokens=usage["completion_tokens"] if usage else len(chunk_times),
             input_tokens=usage["prompt_tokens"] if usage else 0,
+            usage_missing=usage is None,
         )
 
     async def aclose(self) -> None:

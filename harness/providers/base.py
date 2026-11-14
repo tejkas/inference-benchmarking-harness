@@ -10,6 +10,8 @@ class StreamMeasurement:
     end_time: float
     output_tokens: int
     input_tokens: int
+    # Server sent no usage event, so output_tokens is the chunk count and input_tokens is 0
+    usage_missing: bool = False
 
     @property
     def ttft_seconds(self) -> float:
@@ -35,6 +37,7 @@ class StreamMeasurement:
             "end_time": self.end_time - origin,
             "output_tokens": self.output_tokens,
             "input_tokens": self.input_tokens,
+            "usage_missing": self.usage_missing,
         }
 
 
@@ -45,3 +48,12 @@ class Provider(Protocol):
     def stream_once(self, prompt: str, max_tokens: int) -> StreamMeasurement:
         """Send one streaming request and return timing + token measurements."""
         ...
+
+
+class AsyncProvider(Protocol):
+    name: str
+    model: str
+
+    async def stream_once(self, prompt: str, max_tokens: int) -> StreamMeasurement: ...
+
+    async def aclose(self) -> None: ...
