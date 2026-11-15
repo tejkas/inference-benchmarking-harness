@@ -1,12 +1,12 @@
 import argparse
 import asyncio
 import json
-from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
 from harness.datasets import fixed_samples, sharegpt_samples
 from harness.load_runner import sweep_concurrency
+from harness.metrics import format_summary, summarize, summary_header
 from harness.open_loop import raise_open_file_limit, sweep_rates
 from harness.plot import plot_ttft_vs_throughput
 from harness.prompts import PROMPTS
@@ -23,6 +23,10 @@ def main():
     parser.add_argument("--num-requests", type=int, default=100, help="open-loop: requests per rate")
     parser.add_argument("--burstiness", type=float, default=1.0,
                         help="open-loop: 1 = Poisson, below 1 burstier, above 1 more regular")
+    parser.add_argument("--trim", type=float, default=0.1,
+                        help="open-loop: fraction of requests dropped from each end (by send order) for metrics")
+    parser.add_argument("--slo-ttft-ms", type=float, help="open-loop: TTFT target for goodput")
+    parser.add_argument("--slo-tpot-ms", type=float, help="open-loop: TPOT target for goodput")
     parser.add_argument("--dataset", default="fixed", choices=["fixed", "sharegpt"])
     parser.add_argument("--tokenizer", help="Hugging Face repo id for token counts (required for sharegpt)")
     parser.add_argument("--seed", type=int, default=0)
@@ -86,19 +90,21 @@ async def run_rates(args, samples) -> list[dict]:
     print(f"Open-file limit: {raise_open_file_limit()}")
     provider = AsyncOpenAICompatProvider(model=args.model, base_url=args.base_url, ignore_eos=args.ignore_eos)
 
+    slo_ttft = args.slo_ttft_ms / 1e3 if args.slo_ttft_ms is not None else None
+    slo_tpot = args.slo_tpot_ms / 1e3 if args.slo_tpot_ms is not None else None
+
     def progress(r):
-        done = [q for q in r["requests"] if q["error"] is None]
-        out_tps = sum(q["output_tokens"] for q in done) / r["duration_seconds"]
-        errors = Counter(q["error"] for q in r["requests"] if q["error"])
-        print(f"  [rate={r['rate']:g}/s] ok={len(done)}/{r['num_requests']}  out_tok/s={out_tps:.1f}"
-              f"  send_lag_max={r['send_lag']['max'] * 1e3:.1f}ms" + (f"  errors={dict(errors)}" if errors else ""))
+        # Stored next to the raw records; analyze.py can recompute it later
+        r["summary"] = summarize(r, args.trim, slo_ttft, slo_tpot)
+        print(format_summary(r["rate"], r["summary"]))
         for w in r["warnings"]:
-            print(f"    warning: {w}")
+            print(f"{'':>8}- warning: {w}")
 
     try:
         print("Warm up...")
         await provider.stream_once(samples[0].prompt, max_tokens=1)
         print(f"Sweeping rates {args.rates} req/s on {args.model}, {args.num_requests} requests each")
+        print(summary_header())
         return await sweep_rates(provider, samples, args.rates, args.num_requests,
                                  args.burstiness, args.seed, progress)
     finally:
