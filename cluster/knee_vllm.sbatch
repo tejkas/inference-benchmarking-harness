@@ -18,6 +18,8 @@ MODEL=${MODEL:-meta-llama/Llama-3.1-8B-Instruct}  # no Qwen/DeepSeek on GT
 PORT=${PORT:-8000}
 VENV=${VENV:-$HOME/scratch/venvs/bench}           # has vllm + requirements.txt installed
 VLLM_ARGS=${VLLM_ARGS:-}                          # e.g. "--max-num-seqs 64" for ground-truth runs
+# Token and weights live on scratch: home quota is too small for model weights
+export HF_HOME=${HF_HOME:-$HOME/scratch/.cache/huggingface}
 
 source "$VENV/bin/activate"
 cd "$SLURM_SUBMIT_DIR"
