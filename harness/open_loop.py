@@ -5,7 +5,9 @@ import math
 import random
 import resource
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
+from typing import Protocol
 
 import httpx
 
@@ -14,6 +16,7 @@ from .providers.base import AsyncProvider, StreamMeasurement
 
 LAG_PROBE_INTERVAL = 0.010  # seconds between event-loop lag probes
 LAG_WARN_SECONDS = 0.005  # p99 lag above this makes per-chunk timestamps suspect
+ABORT_CHECK_INTERVAL = 0.1  # seconds between abort checks
 
 
 def arrival_offsets(rate: float, n: int, burstiness: float = 1.0, seed: int = 0) -> list[float]:
@@ -90,14 +93,38 @@ def _caused_by_errno(exc: BaseException, code: int) -> bool:
     return False
 
 
-async def _run_one(provider: AsyncProvider, index: int, sample: Sample, scheduled_time: float) -> RequestResult:
-    launch_time = time.perf_counter()
+@dataclass
+class LiveRequest:
+    """A sent request as an abort check sees it while the run is still going."""
+    index: int
+    scheduled_time: float
+    launch_time: float | None = None  # set when the request task starts
+    first_token_time: float | None = None
+    result: RequestResult | None = None  # set when it finishes or fails
+
+
+class AbortCheck(Protocol):
+    def __call__(self, newly_finished: list[LiveRequest], in_flight: Iterable[LiveRequest], now: float) -> bool:
+        """Called every ABORT_CHECK_INTERVAL with requests finished since the last call (each
+        passed exactly once) and those still running. True stops the run."""
+        ...
+
+
+async def _run_one(provider: AsyncProvider, live: LiveRequest, sample: Sample, finished: list[LiveRequest]) -> RequestResult:
+    live.launch_time = time.perf_counter()
+
+    def first_token(t: float) -> None:
+        live.first_token_time = t
+
     try:
-        m = await provider.stream_once(sample.prompt, sample.target_output_tokens)
-        return RequestResult(index, scheduled_time, launch_time, m, None, None)
-    # Exception, not BaseException: CancelledError must still propagate so Ctrl-C stops the run
+        m = await provider.stream_once(sample.prompt, sample.target_output_tokens, on_first_token=first_token)
+        live.result = RequestResult(live.index, live.scheduled_time, live.launch_time, m, None, None)
+    # Exception, not BaseException: CancelledError must still propagate so Ctrl-C and aborts stop it
     except Exception as exc:
-        return RequestResult(index, scheduled_time, launch_time, None, classify_error(exc), time.perf_counter())
+        live.result = RequestResult(live.index, live.scheduled_time, live.launch_time, None,
+                                    classify_error(exc), time.perf_counter())
+    finished.append(live)
+    return live.result
 
 
 async def _probe_loop_lag(lags: list[float]) -> None:
@@ -117,21 +144,42 @@ def _summary(values: list[float]) -> dict | None:
     return {"p50": pick(0.5), "p99": pick(0.99), "max": s[-1]}
 
 
+async def _watch(check: AbortCheck, finished: list[LiveRequest], in_flight: dict[int, LiveRequest],
+                 aborted: asyncio.Event) -> None:
+    while True:
+        await asyncio.sleep(ABORT_CHECK_INTERVAL)
+        batch = finished[:]
+        del finished[:len(batch)]
+        for live in batch:
+            in_flight.pop(live.index, None)
+        if check(batch, in_flight.values(), time.perf_counter()):
+            aborted.set()
+            return
+
+
 async def run_open_loop(
     provider: AsyncProvider,
     samples: list[Sample],
     rate: float,
     burstiness: float = 1.0,
     seed: int = 0,
+    abort_when: AbortCheck | None = None,
 ) -> dict:
     """Send one request per sample on a gamma arrival schedule, never waiting for earlier ones.
 
     Records every request, including failures and the ramp-up and drain at either end.
-    Deciding which requests count toward a metric is left to analysis.
+    Deciding which requests count toward a metric is left to analysis. If abort_when fires,
+    sending stops and in-flight requests are cancelled and recorded with error "aborted".
     """
     offsets = arrival_offsets(rate, len(samples), burstiness, seed)
     loop_lags: list[float] = []
-    monitor = asyncio.create_task(_probe_loop_lag(loop_lags))
+    lives: list[LiveRequest] = []
+    finished: list[LiveRequest] = []
+    in_flight: dict[int, LiveRequest] = {}
+    aborted = asyncio.Event()
+    background = [asyncio.create_task(_probe_loop_lag(loop_lags)), asyncio.create_task(aborted.wait())]
+    if abort_when:
+        background.append(asyncio.create_task(_watch(abort_when, finished, in_flight, aborted)))
     # The event loop only holds weak references to tasks, so keep them here or they can be collected
     tasks: list[asyncio.Task] = []
     origin = time.perf_counter()
@@ -143,13 +191,34 @@ async def run_open_loop(
             delay = scheduled - time.perf_counter()
             if delay > 0:
                 await asyncio.sleep(delay)
-            tasks.append(asyncio.create_task(_run_one(provider, i, sample, scheduled)))
-        results = await asyncio.gather(*tasks)
+            if aborted.is_set():
+                break
+            live = LiveRequest(i, scheduled)
+            lives.append(live)
+            in_flight[i] = live
+            tasks.append(asyncio.create_task(_run_one(provider, live, sample, finished)))
+        # Wait for every request, unless the abort check fires first
+        pending = set(tasks)
+        while pending and not aborted.is_set():
+            _, pending = await asyncio.wait(pending | {background[1]}, return_when=asyncio.FIRST_COMPLETED)
+            pending.discard(background[1])
+        for t in pending:
+            t.cancel()
+        outcomes = await asyncio.gather(*tasks, return_exceptions=True)
     finally:
-        monitor.cancel()
-        for t in tasks:
+        for t in background + tasks:
             t.cancel()  # no-op for finished tasks; stops in-flight ones on Ctrl-C
     end = time.perf_counter()
+
+    results = []
+    for live, outcome in zip(lives, outcomes):
+        if isinstance(outcome, asyncio.CancelledError):
+            launched = live.launch_time if live.launch_time is not None else live.scheduled_time
+            results.append(RequestResult(live.index, live.scheduled_time, launched, None, "aborted", end))
+        elif isinstance(outcome, BaseException):
+            raise outcome
+        else:
+            results.append(outcome)
 
     send_lags = [r.launch_time - r.scheduled_time for r in results]
     loop_lag = _summary(loop_lags)
@@ -163,7 +232,9 @@ async def run_open_loop(
         "rate": rate,
         "burstiness": burstiness,
         "seed": seed,
-        "num_requests": len(samples),
+        "num_requests": len(results),
+        "num_planned": len(samples),
+        "aborted": aborted.is_set(),
         "num_failed": sum(r.error is not None for r in results),
         "duration_seconds": end - origin,
         "send_lag": _summary(send_lags),

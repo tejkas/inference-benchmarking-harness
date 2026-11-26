@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Callable, Protocol
 
 
 @dataclass
@@ -54,6 +54,8 @@ class AsyncProvider(Protocol):
     name: str
     model: str
 
-    async def stream_once(self, prompt: str, max_tokens: int) -> StreamMeasurement: ...
+    async def stream_once(
+        self, prompt: str, max_tokens: int, on_first_token: Callable[[float], None] | None = None
+    ) -> StreamMeasurement: ...
 
     async def aclose(self) -> None: ...

@@ -60,7 +60,19 @@ its scheduled and actual send time, and failures (HTTP errors, timeouts, dropped
 are recorded with a label instead of stopping the run. The run warns if the client itself fell
 behind the schedule or its event loop stalled, since either would distort the timestamps.
 
-Results (JSON, plus a PNG plot in closed-loop mode) are written to `results/`.
+Add `--slo-ttft-ms` / `--slo-tpot-ms` to report goodput: the share of requests that met both
+targets, with failures counted as misses. Each rate prints TTFT, TPOT and inter-token latency
+(p50/p99), throughput, goodput and whether the run was stable (the backlog stopped growing).
+
+`analyze.py` recomputes those metrics from saved results, so you can change the trim or the
+targets without rerunning, and can plot several runs together (e.g. two engines):
+
+```bash
+python analyze.py results/openloop_A.json results/openloop_B.json --labels vLLM SGLang \
+  --slo-ttft-ms 500 --slo-tpot-ms 50 --plot results/compare.png
+```
+
+Results (JSON plus a PNG plot) are written to `results/`.
 
 ## Key findings
 

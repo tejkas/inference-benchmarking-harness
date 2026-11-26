@@ -1,5 +1,7 @@
+import itertools
 import json
 import random
+from collections.abc import Iterator
 from dataclasses import dataclass
 
 from huggingface_hub import hf_hub_download
@@ -27,14 +29,21 @@ def fixed_samples(prompt: str, max_tokens: int, n: int) -> list[Sample]:
 
 def sharegpt_samples(tokenizer_id: str, n: int, seed: int = 0) -> list[Sample]:
     """First user turn as the prompt, first reply's token length as the target output length."""
+    samples = list(itertools.islice(iter_sharegpt_samples(tokenizer_id, seed), n))
+    if len(samples) < n:
+        raise ValueError(f"Only {len(samples)} ShareGPT samples passed the length filters; asked for {n}")
+    return samples
+
+
+def iter_sharegpt_samples(tokenizer_id: str, seed: int = 0) -> Iterator[Sample]:
+    """Same samples in the same order as sharegpt_samples, produced lazily."""
     path = hf_hub_download(SHAREGPT_REPO, SHAREGPT_FILE, repo_type="dataset")
     with open(path) as f:
         conversations = [d["conversations"] for d in json.load(f) if len(d["conversations"]) >= 2]
     random.Random(seed).shuffle(conversations)
 
     tokenizer = Tokenizer.from_pretrained(tokenizer_id)
-    samples: list[Sample] = []
-    # Tokenize lazily: only as many conversations as it takes to fill n samples
+    # Tokenize lazily: only as many conversations as the caller consumes
     for conv in conversations:
         prompt, completion = conv[0]["value"], conv[1]["value"]
         prompt_len = len(tokenizer.encode(prompt, add_special_tokens=False).ids)
@@ -43,7 +52,4 @@ def sharegpt_samples(tokenizer_id: str, n: int, seed: int = 0) -> list[Sample]:
             continue
         if prompt_len > MAX_PROMPT_LEN or prompt_len + output_len > MAX_TOTAL_LEN:
             continue
-        samples.append(Sample(prompt, prompt_len, output_len))
-        if len(samples) == n:
-            return samples
-    raise ValueError(f"Only {len(samples)} ShareGPT samples passed the length filters; asked for {n}")
+        yield Sample(prompt, prompt_len, output_len)

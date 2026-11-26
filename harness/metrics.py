@@ -8,12 +8,13 @@ from collections import Counter
 
 import numpy as np
 
-METRICS_VERSION = 1
+METRICS_VERSION = 2
 MIN_N_FOR_P99 = 100  # below this, p99 is effectively the max
 MULTI_TOKEN_CHUNKS = 1.05  # median tokens per chunk above this: ITL is per chunk, not per token
-# Unstable = the server finished well under what arrived and the backlog grew
+# Unstable = the server finished well under what arrived and the backlog grew by a matching amount
+# (at least the same 10% of arrivals, and never less than 3 requests, so noise can't trigger it)
 UNSTABLE_SERVED_RATIO = 0.9
-UNSTABLE_MIN_BACKLOG = 5
+UNSTABLE_MIN_BACKLOG = 3
 
 
 def request_metrics(r: dict) -> dict | None:
@@ -34,6 +35,15 @@ def request_metrics(r: dict) -> dict | None:
         # Allow one token with no chunk: servers count the EOS token but send no text for it
         "excess_tokens_per_chunk": (n - 1) / len(chunks) if chunks else None,
     }
+
+
+def meets_slo(m: dict | None, slo_ttft: float | None, slo_tpot: float | None) -> bool:
+    """m is request_metrics() output; failed or contentless requests never meet an SLO."""
+    if m is None or m["ttft"] is None:
+        return False
+    if slo_ttft is not None and m["ttft"] > slo_ttft:
+        return False
+    return slo_tpot is None or m["tpot"] is None or m["tpot"] <= slo_tpot
 
 
 def distribution(values: list[float]) -> dict | None:
@@ -95,7 +105,8 @@ def summarize(run: dict, trim: float = 0.1, slo_ttft: float | None = None, slo_t
         backlog = _in_flight(reqs, end) - _in_flight(reqs, start)
         served_ratio = completions / arrivals
         stability = {
-            "stable": not (served_ratio < UNSTABLE_SERVED_RATIO and backlog >= UNSTABLE_MIN_BACKLOG),
+            "stable": not (served_ratio < UNSTABLE_SERVED_RATIO
+                           and backlog >= max(UNSTABLE_MIN_BACKLOG, (1 - UNSTABLE_SERVED_RATIO) * arrivals)),
             "offered_rps": arrivals / span,
             "served_rps": completions / span,
             "backlog_growth": backlog,
@@ -114,13 +125,7 @@ def summarize(run: dict, trim: float = 0.1, slo_ttft: float | None = None, slo_t
 
     goodput = None
     if slo_ttft is not None or slo_tpot is not None:
-        def good(m):
-            if m is None or m["ttft"] is None:
-                return False
-            if slo_ttft is not None and m["ttft"] > slo_ttft:
-                return False
-            return slo_tpot is None or m["tpot"] is None or m["tpot"] <= slo_tpot
-        n_good = sum(good(per[r["index"]]) for r in window)
+        n_good = sum(meets_slo(per[r["index"]], slo_ttft, slo_tpot) for r in window)
         goodput = {
             "slo_ttft": slo_ttft,
             "slo_tpot": slo_tpot,

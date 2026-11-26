@@ -1,5 +1,6 @@
 import json
 import time
+from typing import Callable
 
 import httpx
 from openai import OpenAI
@@ -66,7 +67,9 @@ class AsyncOpenAICompatProvider:
             timeout=httpx.Timeout(timeout, connect=5.0),
         )
 
-    async def stream_once(self, prompt: str, max_tokens: int) -> StreamMeasurement:
+    async def stream_once(
+        self, prompt: str, max_tokens: int, on_first_token: Callable[[float], None] | None = None
+    ) -> StreamMeasurement:
         body = {
             "model": self.model,
             "max_tokens": max_tokens,
@@ -93,6 +96,8 @@ class AsyncOpenAICompatProvider:
                 choices = chunk.get("choices")
                 if choices and choices[0].get("delta", {}).get("content"):
                     chunk_times.append(now)
+                    if on_first_token and len(chunk_times) == 1:
+                        on_first_token(now)
                 if chunk.get("usage"):
                     usage = chunk["usage"]
         end_time = time.perf_counter()
