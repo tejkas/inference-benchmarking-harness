@@ -7,21 +7,11 @@ import itertools
 import math
 from collections.abc import Iterable, Iterator
 
+from .config import Config
 from .datasets import Sample
 from .metrics import meets_slo, request_metrics, summarize
 from .open_loop import LiveRequest, run_open_loop
 from .providers.base import AsyncProvider
-
-DEFAULT_ATTAINMENT = 0.9  # DistServe's goodput target
-RESOLUTION = 1.1  # stop bisecting when hi / lo is within 10%
-MIN_REQUESTS = 100
-MIN_SECONDS = 60  # a slowly growing queue needs time to show, whatever the rate
-MAX_PROBES = 16  # an H100 can sit ~7 doublings above the starting estimate
-MAX_STEP_DOWNS = 3  # confirmation retries when the final passing rate fails on repeat
-
-
-def probe_size(rate: float) -> int:
-    return max(MIN_REQUESTS, math.ceil(rate * MIN_SECONDS))
 
 
 class SloAbort:
@@ -67,8 +57,9 @@ def probe_passes(result: dict, attainment: float, use_slo: bool) -> bool:
     s = result["summary"]
     if result["aborted"]:
         return False
-    # Even with enough good requests, a growing backlog means attainment would keep falling
-    stable = s["stability"] is None or s["stability"]["stable"]
+    # Even with enough good requests, a growing backlog means attainment would keep falling.
+    # None (rate=inf, or too few requests to judge) doesn't fail a probe.
+    stable = s["stability"] is None or s["stability"]["stable"] is not False
     if use_slo:
         return stable and s["goodput"]["attainment"] >= attainment
     return stable
@@ -78,11 +69,9 @@ async def find_knee(
     provider: AsyncProvider,
     samples: Iterator[Sample],
     start_rate: float,
+    cfg: Config,
     slo_ttft: float | None = None,
     slo_tpot: float | None = None,
-    attainment: float = DEFAULT_ATTAINMENT,
-    trim: float = 0.1,
-    burstiness: float = 1.0,
     seed: int = 0,
     on_probe=None,
 ) -> tuple[dict, list[dict]]:
@@ -92,14 +81,14 @@ async def find_knee(
     probes: list[dict] = []
 
     async def probe(rate: float, role: str) -> bool:
-        n = probe_size(rate)
+        n = cfg.probe_size(rate)
         chunk = list(itertools.islice(samples, n))
         if len(chunk) < n:
             raise ValueError(f"dataset ran out: needed {n} more prompts for a probe at {rate:g} req/s")
-        abort = SloAbort(n, trim, attainment, slo_ttft, slo_tpot) if use_slo else None
-        result = await run_open_loop(provider, chunk, rate, burstiness, seed, abort_when=abort)
-        result["summary"] = summarize(result, trim, slo_ttft, slo_tpot)
-        ok = probe_passes(result, attainment, use_slo)
+        abort = SloAbort(n, cfg.trim, cfg.attainment, slo_ttft, slo_tpot) if use_slo else None
+        result = await run_open_loop(provider, chunk, rate, cfg, seed, abort_when=abort)
+        result["summary"] = summarize(result, cfg, slo_ttft, slo_tpot)
+        ok = probe_passes(result, cfg.attainment, use_slo)
         result["knee_probe"] = {"role": role, "pass": ok}
         if result["aborted"]:
             # The summary covers only the requests sent before the stop; this is what decided the probe
@@ -113,7 +102,7 @@ async def find_knee(
     lo = hi = None
     rate = start_rate
     # Bracket: double while passing, halve while failing, until one of each
-    while (lo is None or hi is None) and len(probes) < MAX_PROBES:
+    while (lo is None or hi is None) and len(probes) < cfg.max_probes:
         if await probe(rate, "bracket"):
             lo = rate
             rate *= 2
@@ -121,7 +110,7 @@ async def find_knee(
             hi = rate
             rate /= 2
     # Bisect geometrically: capacity spans orders of magnitude across hardware
-    while lo is not None and hi is not None and hi / lo > RESOLUTION and len(probes) < MAX_PROBES:
+    while lo is not None and hi is not None and hi / lo > cfg.knee_resolution and len(probes) < cfg.max_probes:
         mid = math.sqrt(lo * hi)
         if await probe(mid, "bisect"):
             lo = mid
@@ -129,17 +118,17 @@ async def find_knee(
             hi = mid
     # Confirm: one false pass near the knee would otherwise be the answer
     confirmed = False
-    for _ in range(MAX_STEP_DOWNS):
+    for _ in range(cfg.max_step_downs):
         if lo is None:
             break
         if await probe(lo, "confirm"):
             confirmed = True
             break
-        hi, lo = lo, lo / RESOLUTION
+        hi, lo = lo, lo / cfg.knee_resolution
 
     knee = {
-        "criterion": f"attainment >= {attainment:.0%} and stable" if use_slo else "stable",
-        "attainment": attainment if use_slo else None,
+        "criterion": f"attainment >= {cfg.attainment:.0%} and stable" if use_slo else "stable",
+        "attainment": cfg.attainment if use_slo else None,
         "slo_ttft": slo_ttft,
         "slo_tpot": slo_tpot,
         "lo": lo,

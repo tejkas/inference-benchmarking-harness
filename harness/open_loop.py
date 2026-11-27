@@ -11,26 +11,28 @@ from typing import Protocol
 
 import httpx
 
+from .config import Config
 from .datasets import Sample
 from .providers.base import AsyncProvider, StreamMeasurement
 
 LAG_PROBE_INTERVAL = 0.010  # seconds between event-loop lag probes
-LAG_WARN_SECONDS = 0.005  # p99 lag above this makes per-chunk timestamps suspect
 ABORT_CHECK_INTERVAL = 0.1  # seconds between abort checks
 
 
-def arrival_offsets(rate: float, n: int, burstiness: float = 1.0, seed: int = 0) -> list[float]:
+def arrival_offsets(rate: float, n: int, cv: float = 1.0, seed: int = 0) -> list[float]:
     """Send times in seconds from the start of the run, for n requests averaging `rate` per second.
 
-    Gaps between arrivals are gamma-distributed with mean 1/rate. burstiness=1 gives
-    exponential gaps (a Poisson process); below 1 is burstier, above 1 more regular.
-    rate=inf sends everything at once.
+    Gaps between arrivals are gamma-distributed with mean 1/rate and coefficient of variation
+    cv (std / mean). cv=1 gives exponential gaps (a Poisson process), 0 evenly spaced ones,
+    above 1 bursts. rate=inf sends everything at once.
     """
     if math.isinf(rate):
         return [0.0] * n
+    if cv == 0:
+        return [i / rate for i in range(n)]
     rng = random.Random(seed)
-    shape = burstiness
-    scale = 1.0 / (rate * burstiness)  # keeps the mean gap at shape * scale = 1/rate
+    shape = 1 / cv**2  # a gamma's cv is 1 / sqrt(shape)
+    scale = 1.0 / (rate * shape)  # keeps the mean gap at shape * scale = 1/rate
     offsets = []
     t = 0.0
     for _ in range(n):
@@ -161,7 +163,7 @@ async def run_open_loop(
     provider: AsyncProvider,
     samples: list[Sample],
     rate: float,
-    burstiness: float = 1.0,
+    cfg: Config,
     seed: int = 0,
     abort_when: AbortCheck | None = None,
 ) -> dict:
@@ -171,7 +173,7 @@ async def run_open_loop(
     Deciding which requests count toward a metric is left to analysis. If abort_when fires,
     sending stops and in-flight requests are cancelled and recorded with error "aborted".
     """
-    offsets = arrival_offsets(rate, len(samples), burstiness, seed)
+    offsets = arrival_offsets(rate, len(samples), cfg.arrival_cv, seed)
     loop_lags: list[float] = []
     lives: list[LiveRequest] = []
     finished: list[LiveRequest] = []
@@ -223,14 +225,15 @@ async def run_open_loop(
     send_lags = [r.launch_time - r.scheduled_time for r in results]
     loop_lag = _summary(loop_lags)
     warnings = []
-    if loop_lag and loop_lag["p99"] > LAG_WARN_SECONDS:
+    lag_warn = cfg.lag_warn_ms / 1e3
+    if loop_lag and loop_lag["p99"] > lag_warn:
         warnings.append(f"event loop p99 lag {loop_lag['p99'] * 1e3:.1f} ms: chunk timestamps may be late by this much")
-    if max(send_lags, default=0) > LAG_WARN_SECONDS:
+    if max(send_lags, default=0) > lag_warn:
         warnings.append(f"max send lag {max(send_lags) * 1e3:.1f} ms: arrivals did not follow the schedule")
 
     return {
         "rate": rate,
-        "burstiness": burstiness,
+        "arrival_cv": cfg.arrival_cv,
         "seed": seed,
         "num_requests": len(results),
         "num_planned": len(samples),
@@ -261,7 +264,7 @@ async def sweep_rates(
     samples: list[Sample],
     rates: list[float],
     num_requests: int,
-    burstiness: float = 1.0,
+    cfg: Config,
     seed: int = 0,
     on_progress=None,
 ) -> list[dict]:
@@ -273,7 +276,7 @@ async def sweep_rates(
     results = []
     for i, rate in enumerate(rates):
         chunk = samples[i * num_requests:(i + 1) * num_requests]
-        result = await run_open_loop(provider, chunk, rate, burstiness, seed)
+        result = await run_open_loop(provider, chunk, rate, cfg, seed)
         results.append(result)
         if on_progress:
             on_progress(result)

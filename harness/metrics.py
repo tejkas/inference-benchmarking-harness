@@ -8,13 +8,10 @@ from collections import Counter
 
 import numpy as np
 
-METRICS_VERSION = 2
-MIN_N_FOR_P99 = 100  # below this, p99 is effectively the max
-MULTI_TOKEN_CHUNKS = 1.05  # median tokens per chunk above this: ITL is per chunk, not per token
-# Unstable = the server finished well under what arrived and the backlog grew by a matching amount
-# (at least the same 10% of arrivals, and never less than 3 requests, so noise can't trigger it)
-UNSTABLE_SERVED_RATIO = 0.9
-UNSTABLE_MIN_BACKLOG = 3
+from .config import Config
+
+METRICS_VERSION = 3
+TREND_POINTS = 200  # samples of the in-flight count for the stability trend fit
 
 
 def request_metrics(r: dict) -> dict | None:
@@ -57,11 +54,20 @@ def _finish_time(r: dict) -> float:
     return r["end_time"] if r["error"] is None else r["error_time"]
 
 
-def _in_flight(requests: list[dict], t: float) -> int:
-    return sum(r["launch_time"] <= t < _finish_time(r) for r in requests)
+def _backlog_trend(requests: list[dict], start: float, end: float) -> float:
+    """Least-squares slope of the in-flight count over [start, end], in requests per second.
+
+    In flight at t = launched by t - finished by t. A fitted line uses the whole window; the
+    difference between the counts at the two ends would carry the noise of both moments.
+    """
+    launches = np.sort([r["launch_time"] for r in requests])
+    finishes = np.sort([_finish_time(r) for r in requests])
+    ts = np.linspace(start, end, TREND_POINTS)
+    in_flight = np.searchsorted(launches, ts, side="right") - np.searchsorted(finishes, ts, side="right")
+    return float(np.polyfit(ts, in_flight, 1)[0])
 
 
-def summarize(run: dict, trim: float = 0.1, slo_ttft: float | None = None, slo_tpot: float | None = None) -> dict:
+def summarize(run: dict, cfg: Config, slo_ttft: float | None = None, slo_tpot: float | None = None) -> dict:
     """Metrics over the steady-state window of one open-loop run. SLOs are in seconds.
 
     The window drops the first and last `trim` fraction of requests by send order. Selecting by
@@ -69,7 +75,7 @@ def summarize(run: dict, trim: float = 0.1, slo_ttft: float | None = None, slo_t
     saturation and hide the tail.
     """
     reqs = sorted(run["requests"], key=lambda r: r["launch_time"])
-    k = int(len(reqs) * trim)
+    k = int(len(reqs) * cfg.trim)
     window = reqs[k:len(reqs) - k] or reqs
     per = {r["index"]: request_metrics(r) for r in reqs}
     done = [per[r["index"]] for r in window if per[r["index"]] is not None]
@@ -78,12 +84,12 @@ def summarize(run: dict, trim: float = 0.1, slo_ttft: float | None = None, slo_t
     ttfts = [m["ttft"] for m in done if m["ttft"] is not None]
     if len(done) > len(ttfts):
         notes.append(f"{len(done) - len(ttfts)} requests finished without any content")
-    if len(ttfts) < MIN_N_FOR_P99:
+    if len(ttfts) < cfg.min_n_for_p99:
         notes.append(f"only {len(ttfts)} requests in the window: p99 is close to the max")
     tpc = [m["tokens_per_chunk"] for m in done if m["tokens_per_chunk"] is not None]
     median_tpc = float(np.median(tpc)) if tpc else None
     excess = [m["excess_tokens_per_chunk"] for m in done if m["excess_tokens_per_chunk"] is not None]
-    if excess and np.median(excess) > MULTI_TOKEN_CHUNKS:
+    if excess and np.median(excess) > cfg.multi_token_chunks:
         notes.append(f"~{median_tpc:.1f} tokens per chunk: ITL is per chunk, not per token")
     # Fewer tokens than asked for: the server stopped at EOS (ignore_eos off or not honored)
     early_stops = sum(r["error"] is None and r["output_tokens"] < r["target_output_tokens"] for r in window)
@@ -102,14 +108,19 @@ def summarize(run: dict, trim: float = 0.1, slo_ttft: float | None = None, slo_t
     if timed:
         arrivals = len(window)
         completions = sum(start <= _finish_time(r) <= end for r in reqs)
-        backlog = _in_flight(reqs, end) - _in_flight(reqs, start)
-        served_ratio = completions / arrivals
+        trend = _backlog_trend(reqs, start, end)
+        allowed = cfg.stability_tolerance * arrivals
+        judgeable = allowed >= 1  # a tolerance under one request can't tell growth from noise
+        if not judgeable:
+            notes.append(f"only {arrivals} requests in the window: too few to judge stability")
         stability = {
-            "stable": not (served_ratio < UNSTABLE_SERVED_RATIO
-                           and backlog >= max(UNSTABLE_MIN_BACKLOG, (1 - UNSTABLE_SERVED_RATIO) * arrivals)),
+            # Unstable: the backlog's fitted growth over the window exceeds the tolerance
+            "stable": trend * span <= allowed if judgeable else None,
             "offered_rps": arrivals / span,
             "served_rps": completions / span,
-            "backlog_growth": backlog,
+            "backlog_trend_rps": trend,
+            "backlog_growth": trend * span,
+            "allowed_growth": allowed,
         }
         # Count tokens as they arrive inside the window, so long requests aren't credited all at once
         window_tokens = sum(
@@ -139,7 +150,8 @@ def summarize(run: dict, trim: float = 0.1, slo_ttft: float | None = None, slo_t
     run_tokens = sum(r["output_tokens"] for r in reqs if r["error"] is None)
     return {
         "metrics_version": METRICS_VERSION,
-        "trim": trim,
+        "trim": cfg.trim,
+        "stability_tolerance": cfg.stability_tolerance,
         "window_requests": len(window),
         "window_completed": len(done),
         "failures": dict(Counter(r["error"] for r in window if r["error"])),
@@ -166,7 +178,8 @@ def summary_header() -> str:
 def format_summary(rate: float, s: dict) -> str:
     def ms(d, key):
         return f"{d[key] * 1e3:.0f}" if d else "-"
-    stable = "n/a" if s["stability"] is None else ("yes" if s["stability"]["stable"] else "NO")
+    st = s["stability"]
+    stable = "n/a" if st is None or st["stable"] is None else ("yes" if st["stable"] else "NO")
     tps = s["output_tps"]["window"] or s["output_tps"]["run"]
     good = f"{s['goodput']['attainment']:.0%}" if s["goodput"] else "-"
     line = (f"{rate:>6g} {s['window_completed']:>4}/{s['window_requests']:<3} {stable:>6}"

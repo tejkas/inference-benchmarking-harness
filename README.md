@@ -55,14 +55,17 @@ python run.py --model qwen2.5:7b --dataset sharegpt --tokenizer Qwen/Qwen2.5-7B-
   --ignore-eos --rates 0.5 1 2 4 --num-requests 100
 ```
 
-`--burstiness` below 1 makes arrivals burstier (1 is Poisson). Every request is recorded with
+`--arrival-cv` sets how uneven the gaps between requests are (standard deviation / mean):
+1 is Poisson (the default), 0 evenly spaced, above 1 bursty. vLLM's `--burstiness` is
+1 / cv². Every request is recorded with
 its scheduled and actual send time, and failures (HTTP errors, timeouts, dropped connections)
 are recorded with a label instead of stopping the run. The run warns if the client itself fell
 behind the schedule or its event loop stalled, since either would distort the timestamps.
 
 Add `--slo-ttft-ms` / `--slo-tpot-ms` to report goodput: the share of requests that met both
 targets, with failures counted as misses. Each rate prints TTFT, TPOT and inter-token latency
-(p50/p99), throughput, goodput and whether the run was stable (the backlog stopped growing).
+(p50/p99), throughput, goodput and whether the run was stable: a line fitted to the number of
+requests in flight over the run may grow by at most 5% of the requests that arrived.
 
 `analyze.py` recomputes those metrics from saved results, so you can change the trim or the
 targets without rerunning, and can plot several runs together (e.g. two engines):
@@ -71,6 +74,49 @@ targets without rerunning, and can plot several runs together (e.g. two engines)
 python analyze.py results/openloop_A.json results/openloop_B.json --labels vLLM SGLang \
   --slo-ttft-ms 500 --slo-tpot-ms 50 --plot results/compare.png
 ```
+
+### Knee search
+
+`--find-knee` searches for the highest arrival rate the server sustains. With SLOs, it's the
+highest rate where at least 90% of requests meet them.
+
+```bash
+python run.py --model qwen2.5:7b --dataset sharegpt --tokenizer Qwen/Qwen2.5-7B-Instruct \
+  --ignore-eos --find-knee --slo-ttft-ms 1000 --slo-tpot-ms 50
+```
+
+Each probe is one open-loop run at a single rate, with at least 100 requests and at least
+60 seconds. A probe fails if it is unstable, misses the attainment target, or is stopped early
+because enough requests have already missed their targets that the probe can't pass.
+
+1. **Bracket:** start at 1 / the latency of a lone request and double until a probe fails.
+2. **Bisect:** probe the geometric midpoint until the failing rate is within 10% of the
+   passing one.
+3. **Confirm:** re-probe the passing rate.
+
+The result is a range: "passes at X req/s, fails at Y". `cluster/knee_vllm.sbatch` runs it
+against vLLM, under Slurm or directly on a GPU machine.
+
+### Settings
+
+Every methodology setting lives in `harness/config.py`: arrival pattern, window trim,
+stability tolerance, attainment, probe sizes, search limits, warning thresholds and ShareGPT
+filters. Each one is labelled with where its default comes from (convention, statistics,
+judgment or safety) and why. Override them with a TOML file:
+
+```toml
+# my_settings.toml
+trim = 0.05
+probe_min_seconds = 120
+```
+
+```bash
+python run.py ... --config my_settings.toml
+```
+
+The command-line flags `--arrival-cv`, `--trim` and `--attainment` take precedence over the
+file. Every results file stores the full set of settings it was produced with, and
+`analyze.py` re-analyzes each file with its own settings unless you override them.
 
 Results (JSON plus a PNG plot) are written to `results/`.
 

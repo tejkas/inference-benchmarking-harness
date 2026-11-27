@@ -7,13 +7,10 @@ from dataclasses import dataclass
 from huggingface_hub import hf_hub_download
 from tokenizers import Tokenizer
 
+from .config import Config
+
 SHAREGPT_REPO = "anon8231489123/ShareGPT_Vicuna_unfiltered"
 SHAREGPT_FILE = "ShareGPT_V3_unfiltered_cleaned_split.json"
-
-# Length filters match vLLM's ShareGPT sampling so results stay comparable
-MIN_LEN = 4
-MAX_PROMPT_LEN = 1024
-MAX_TOTAL_LEN = 2048
 
 
 @dataclass
@@ -27,15 +24,15 @@ def fixed_samples(prompt: str, max_tokens: int, n: int) -> list[Sample]:
     return [Sample(prompt, None, max_tokens) for _ in range(n)]
 
 
-def sharegpt_samples(tokenizer_id: str, n: int, seed: int = 0) -> list[Sample]:
+def sharegpt_samples(tokenizer_id: str, n: int, cfg: Config, seed: int = 0) -> list[Sample]:
     """First user turn as the prompt, first reply's token length as the target output length."""
-    samples = list(itertools.islice(iter_sharegpt_samples(tokenizer_id, seed), n))
+    samples = list(itertools.islice(iter_sharegpt_samples(tokenizer_id, cfg, seed), n))
     if len(samples) < n:
         raise ValueError(f"Only {len(samples)} ShareGPT samples passed the length filters; asked for {n}")
     return samples
 
 
-def iter_sharegpt_samples(tokenizer_id: str, seed: int = 0) -> Iterator[Sample]:
+def iter_sharegpt_samples(tokenizer_id: str, cfg: Config, seed: int = 0) -> Iterator[Sample]:
     """Same samples in the same order as sharegpt_samples, produced lazily."""
     path = hf_hub_download(SHAREGPT_REPO, SHAREGPT_FILE, repo_type="dataset")
     with open(path) as f:
@@ -48,8 +45,8 @@ def iter_sharegpt_samples(tokenizer_id: str, seed: int = 0) -> Iterator[Sample]:
         prompt, completion = conv[0]["value"], conv[1]["value"]
         prompt_len = len(tokenizer.encode(prompt, add_special_tokens=False).ids)
         output_len = len(tokenizer.encode(completion, add_special_tokens=False).ids)
-        if prompt_len < MIN_LEN or output_len < MIN_LEN:
+        if prompt_len < cfg.sharegpt_min_len or output_len < cfg.sharegpt_min_len:
             continue
-        if prompt_len > MAX_PROMPT_LEN or prompt_len + output_len > MAX_TOTAL_LEN:
+        if prompt_len > cfg.sharegpt_max_prompt_len or prompt_len + output_len > cfg.sharegpt_max_total_len:
             continue
         yield Sample(prompt, prompt_len, output_len)

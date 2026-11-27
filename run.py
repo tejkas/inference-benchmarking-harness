@@ -6,8 +6,9 @@ import statistics
 from datetime import datetime, timezone
 from pathlib import Path
 
+from harness.config import load_config
 from harness.datasets import Sample, fixed_samples, iter_sharegpt_samples, sharegpt_samples
-from harness.knee import DEFAULT_ATTAINMENT, find_knee
+from harness.knee import find_knee
 from harness.load_runner import sweep_concurrency
 from harness.metrics import format_summary, summarize, summary_header
 from harness.open_loop import raise_open_file_limit, sweep_rates
@@ -24,16 +25,16 @@ def main():
     parser.add_argument("--rates", type=float, nargs="+",
                         help="Open-loop mode: arrival rates in requests/s (inf sends all at once)")
     parser.add_argument("--num-requests", type=int, default=100, help="open-loop: requests per rate")
-    parser.add_argument("--burstiness", type=float, default=1.0,
-                        help="open-loop: 1 = Poisson, below 1 burstier, above 1 more regular")
-    parser.add_argument("--trim", type=float, default=0.1,
+    parser.add_argument("--config", help="TOML file overriding methodology settings (see harness/config.py)")
+    parser.add_argument("--arrival-cv", type=float,
+                        help="open-loop: spread of gaps between arrivals; 1 = Poisson (default), 0 = even, above 1 = bursty")
+    parser.add_argument("--trim", type=float,
                         help="open-loop: fraction of requests dropped from each end (by send order) for metrics")
     parser.add_argument("--slo-ttft-ms", type=float, help="open-loop: TTFT target for goodput")
     parser.add_argument("--slo-tpot-ms", type=float, help="open-loop: TPOT target for goodput")
     parser.add_argument("--find-knee", action="store_true",
                         help="Search for the highest sustainable rate (with SLOs: the highest meeting them)")
-    parser.add_argument("--attainment", type=float, default=DEFAULT_ATTAINMENT,
-                        help="knee: share of requests that must meet the SLOs")
+    parser.add_argument("--attainment", type=float, help="knee: share of requests that must meet the SLOs")
     parser.add_argument("--knee-start", type=float,
                         help="knee: first rate to probe (default: 1 / latency of a lone request)")
     parser.add_argument("--dataset", default="fixed", choices=["fixed", "sharegpt"])
@@ -47,24 +48,25 @@ def main():
 
     if args.dataset == "sharegpt" and not args.tokenizer:
         parser.error("--tokenizer is required with --dataset sharegpt")
+    cfg = load_config(args.config, arrival_cv=args.arrival_cv, trim=args.trim, attainment=args.attainment)
     prompt = next(p for p in PROMPTS if p.name == args.prompt)
     extra = {}
     if args.find_knee:
         # The search decides how many prompts it needs, so hand it an endless supply
         if args.dataset == "sharegpt":
-            stream = iter_sharegpt_samples(args.tokenizer, args.seed)
+            stream = iter_sharegpt_samples(args.tokenizer, cfg, args.seed)
         else:
             stream = itertools.repeat(Sample(prompt.text, None, args.max_tokens))
         mode = "knee"
-        extra["knee"], results = asyncio.run(run_knee(args, stream))
+        extra["knee"], results = asyncio.run(run_knee(args, cfg, stream))
     else:
         n = args.num_requests * len(args.rates) if args.rates else sum(args.levels)
         if args.dataset == "sharegpt":
-            samples = sharegpt_samples(args.tokenizer, n, args.seed)
+            samples = sharegpt_samples(args.tokenizer, n, cfg, args.seed)
         else:
             samples = fixed_samples(prompt.text, args.max_tokens, n)
         if args.rates:
-            mode, results = "openloop", asyncio.run(run_rates(args, samples))
+            mode, results = "openloop", asyncio.run(run_rates(args, cfg, samples))
         else:
             mode, results = "closedloop", run_levels(args, samples)
 
@@ -83,6 +85,7 @@ def main():
             "tokenizer": args.tokenizer,
             "seed": args.seed,
             "ignore_eos": args.ignore_eos,
+            "config": cfg.to_dict(),  # every methodology setting this result was produced with
             **extra,
             "results": results,
         }, f, indent=2)
@@ -115,7 +118,7 @@ def run_levels(args, samples) -> list[dict]:
     return sweep_concurrency(provider, samples, args.levels, progress)
 
 
-async def run_rates(args, samples) -> list[dict]:
+async def run_rates(args, cfg, samples) -> list[dict]:
     print(f"Open-file limit: {raise_open_file_limit()}")
     provider = AsyncOpenAICompatProvider(model=args.model, base_url=args.base_url, ignore_eos=args.ignore_eos)
 
@@ -124,7 +127,7 @@ async def run_rates(args, samples) -> list[dict]:
 
     def progress(r):
         # Stored next to the raw records; analyze.py can recompute it later
-        r["summary"] = summarize(r, args.trim, slo_ttft, slo_tpot)
+        r["summary"] = summarize(r, cfg, slo_ttft, slo_tpot)
         print(format_summary(r["rate"], r["summary"]))
         for w in r["warnings"]:
             print(f"{'':>8}- warning: {w}")
@@ -134,13 +137,12 @@ async def run_rates(args, samples) -> list[dict]:
         await provider.stream_once(samples[0].prompt, max_tokens=1)
         print(f"Sweeping rates {args.rates} req/s on {args.model}, {args.num_requests} requests each")
         print(summary_header())
-        return await sweep_rates(provider, samples, args.rates, args.num_requests,
-                                 args.burstiness, args.seed, progress)
+        return await sweep_rates(provider, samples, args.rates, args.num_requests, cfg, args.seed, progress)
     finally:
         await provider.aclose()
 
 
-async def run_knee(args, stream) -> tuple[dict, list[dict]]:
+async def run_knee(args, cfg, stream) -> tuple[dict, list[dict]]:
     print(f"Open-file limit: {raise_open_file_limit()}")
     provider = AsyncOpenAICompatProvider(model=args.model, base_url=args.base_url, ignore_eos=args.ignore_eos)
     slo_ttft = args.slo_ttft_ms / 1e3 if args.slo_ttft_ms is not None else None
@@ -164,14 +166,13 @@ async def run_knee(args, stream) -> tuple[dict, list[dict]]:
         if start is None:
             # A server running one request at a time sustains 1 / latency; real capacity is higher
             lat = []
-            for s in itertools.islice(stream, 3):
+            for s in itertools.islice(stream, cfg.knee_start_samples):
                 m = await provider.stream_once(s.prompt, s.target_output_tokens)
                 lat.append(m.end_time - m.send_time)
             start = 1 / statistics.median(lat)
         print(f"Knee search on {args.model}, starting at {start:.3g} req/s")
         print(summary_header())
-        knee, probes = await find_knee(provider, stream, start, slo_ttft, slo_tpot, args.attainment,
-                                       args.trim, args.burstiness, args.seed, progress)
+        knee, probes = await find_knee(provider, stream, start, cfg, slo_ttft, slo_tpot, args.seed, progress)
     finally:
         await provider.aclose()
     hi = f"{knee['hi']:.3g}" if knee["hi"] is not None else "not found"
