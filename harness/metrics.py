@@ -110,12 +110,9 @@ def summarize(run: dict, cfg: Config, slo_ttft: float | None = None, slo_tpot: f
         completions = sum(start <= _finish_time(r) <= end for r in reqs)
         trend = _backlog_trend(reqs, start, end)
         allowed = cfg.stability_tolerance * arrivals
-        judgeable = allowed >= 1  # a tolerance under one request can't tell growth from noise
-        if not judgeable:
-            notes.append(f"only {arrivals} requests in the window: too few to judge stability")
         stability = {
             # Unstable: the backlog's fitted growth over the window exceeds the tolerance
-            "stable": trend * span <= allowed if judgeable else None,
+            "stable": trend * span <= allowed,
             "offered_rps": arrivals / span,
             "served_rps": completions / span,
             "backlog_trend_rps": trend,
@@ -179,7 +176,7 @@ def format_summary(rate: float, s: dict) -> str:
     def ms(d, key):
         return f"{d[key] * 1e3:.0f}" if d else "-"
     st = s["stability"]
-    stable = "n/a" if st is None or st["stable"] is None else ("yes" if st["stable"] else "NO")
+    stable = "n/a" if st is None else ("yes" if st["stable"] else "NO")
     tps = s["output_tps"]["window"] or s["output_tps"]["run"]
     good = f"{s['goodput']['attainment']:.0%}" if s["goodput"] else "-"
     line = (f"{rate:>6g} {s['window_completed']:>4}/{s['window_requests']:<3} {stable:>6}"

@@ -58,8 +58,8 @@ def probe_passes(result: dict, attainment: float, use_slo: bool) -> bool:
     if result["aborted"]:
         return False
     # Even with enough good requests, a growing backlog means attainment would keep falling.
-    # None (rate=inf, or too few requests to judge) doesn't fail a probe.
-    stable = s["stability"] is None or s["stability"]["stable"] is not False
+    # No stability block (rate=inf: everything sent at once) doesn't fail a probe.
+    stable = s["stability"] is None or s["stability"]["stable"]
     if use_slo:
         return stable and s["goodput"]["attainment"] >= attainment
     return stable
